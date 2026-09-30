@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inventory Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='3' width='14' height='11' rx='2' fill='%232a78d6'/><rect x='4' y='1' width='8' height='4' rx='1' fill='%232a78d6'/></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Inventory Tracker <span class="muted">cards · figures · art</span></div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-view="dashboard" class="tab active">Dashboard</button>
+      <button role="tab" data-view="inventory" class="tab">Inventory</button>
+    </nav>
+    <div class="top-actions">
+      <button id="theme-toggle" class="btn ghost" title="Toggle light/dark">◐</button>
+      <button id="add-btn" class="btn primary">+ Add item</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Dashboard -->
+    <section id="view-dashboard" class="view">
+      <div id="kpis" class="kpis"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Net profit by month</h2>
+          <span class="muted small">Last 12 months · hover a bar for details</span>
+        </div>
+        <div id="monthly-chart" class="chart"></div>
+        <details class="table-view">
+          <summary>Show as table</summary>
+          <div id="monthly-table"></div>
+        </details>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h2>By category</h2></div>
+          <div id="category-table"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Sales by platform</h2></div>
+          <div id="platform-table"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Aging stock</h2>
+          <span class="muted small">Unsold for 90+ days (excludes personal collection)</span>
+        </div>
+        <div id="aging-table"></div>
+      </div>
+    </section>
+
+    <!-- Inventory -->
+    <section id="view-inventory" class="view" hidden>
+      <div class="filters">
+        <input id="search" type="search" placeholder="Search name, SKU, set, artist, tags…" autocomplete="off">
+        <select id="filter-category" aria-label="Category">
+          <option value="">All categories</option>
+          <option value="card">Cards</option>
+          <option value="figure">Figures</option>
+          <option value="art">Art</option>
+        </select>
+        <select id="filter-status" aria-label="Status">
+          <option value="unsold">Unsold</option>
+          <option value="">All statuses</option>
+          <option value="in_stock">In stock</option>
+          <option value="listed">Listed</option>
+          <option value="sold">Sold</option>
+          <option value="personal">Personal collection</option>
+        </select>
+        <span class="spacer"></span>
+        <button id="export-btn" class="btn">Export CSV</button>
+        <label class="btn" for="import-file">Import CSV</label>
+        <input id="import-file" type="file" accept=".csv,text/csv" hidden>
+        <a class="btn" href="/api/backup" title="Download a copy of the database">Backup</a>
+      </div>
+      <div id="summary" class="muted small summary"></div>
+      <div class="table-wrap">
+        <table id="items-table" class="items">
+          <thead>
+            <tr>
+              <th></th>
+              <th data-sort="sku">SKU</th>
+              <th data-sort="name">Item</th>
+              <th data-sort="status">Status</th>
+              <th data-sort="quantity" class="num">Qty</th>
+              <th data-sort="total_cost" class="num">Cost</th>
+              <th data-sort="market_value" class="num">Value / List</th>
+              <th data-sort="profit" class="num">Sold / Profit</th>
+              <th data-sort="days_held" class="num">Days</th>
+              <th data-sort="location">Location</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div id="empty" class="empty" hidden>No items match. Click <b>+ Add item</b> to get started.</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Item form -->
+  <dialog id="item-dialog">
+    <form id="item-form" method="dialog">
+      <div class="dialog-head">
+        <h2 id="item-dialog-title">Add item</h2>
+        <button type="button" class="btn ghost close" data-close aria-label="Close">✕</button>
+      </div>
+      <div class="dialog-body">
+        <fieldset>
+          <legend>Basics</legend>
+          <div class="cat-picker" role="radiogroup">
+            <label><input type="radio" name="category" value="card" checked> Card</label>
+            <label><input type="radio" name="category" value="figure"> Figure</label>
+            <label><input type="radio" name="category" value="art"> Art</label>
+          </div>
+          <div class="form-grid">
+            <label class="span-2">Name *<input name="name" required placeholder="e.g. Charizard Holo, Base Set"></label>
+            <label>Status
+              <select name="status">
+                <option value="in_stock">In stock</option>
+                <option value="listed">Listed</option>
+                <option value="sold">Sold</option>
+                <option value="personal">Personal collection</option>
+              </select>
+            </label>
+            <label>Quantity<input name="quantity" type="number" min="1" step="1" value="1"></label>
+            <label>Condition<input name="condition" list="conditions" placeholder="NM, Mint, Good…"></label>
+            <label>Year<input name="year" placeholder="1999"></label>
+            <label>SKU<input name="sku" placeholder="auto if blank"></label>
+            <label>Location<input name="location" placeholder="Binder 2, Shelf B…"></label>
+          </div>
+        </fieldset>
+
+        <fieldset data-cat="card">
+          <legend>Card details</legend>
+          <div class="form-grid">
+            <label class="span-2">Set<input name="set_name" placeholder="Base Set, Prizm 2023…"></label>
+            <label>Card #<input name="card_number"></label>
+            <label>Grader<input name="grader" list="graders" placeholder="Raw, PSA, BGS…"></label>
+            <label>Grade<input name="grade" placeholder="10, 9.5…"></label>
+            <label>Cert #<input name="cert_number"></label>
+          </div>
+        </fieldset>
+
+        <fieldset data-cat="figure">
+          <legend>Figure details</legend>
+          <div class="form-grid">
+            <label>Brand<input name="brand" placeholder="Hasbro, Funko, Good Smile…"></label>
+            <label>Line / series<input name="series"></label>
+            <label>Packaging
+              <select name="packaging">
+                <option value=""></option>
+                <option>Sealed / new in box</option>
+                <option>Opened, complete</option>
+                <option>Loose</option>
+                <option>Incomplete</option>
+              </select>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset data-cat="art">
+          <legend>Art details</legend>
+          <div class="form-grid">
+            <label>Artist<input name="artist"></label>
+            <label>Medium<input name="medium" placeholder="Print, oil, acrylic…"></label>
+            <label>Dimensions<input name="dimensions" placeholder='18" x 24"'></label>
+            <label>Signed
+              <select name="signed"><option value=""></option><option>Yes</option><option>No</option></select>
+            </label>
+            <label>Edition<input name="edition" placeholder="12/50"></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Purchase</legend>
+          <div class="form-grid">
+            <label>Total cost ($)<input name="cost" inputmode="decimal" placeholder="0.00"></label>
+            <label>Shipping in ($)<input name="shipping_in" inputmode="decimal" placeholder="0.00"></label>
+            <label>Purchase date<input name="purchase_date" type="date"></label>
+            <label>Bought from<input name="purchase_source" placeholder="Card show, eBay, estate sale…"></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Value &amp; listing</legend>
+          <div class="form-grid">
+            <label>Market value ($)<input name="market_value" inputmode="decimal" placeholder="0.00"></label>
+            <label>List price ($)<input name="list_price" inputmode="decimal" placeholder="0.00"></label>
+            <label>Listed on<input name="listed_platform" list="platforms"></label>
+            <label>Listed date<input name="listed_date" type="date"></label>
+            <label class="span-4">Listing URL<input name="listing_url" type="url" placeholder="https://"></label>
+          </div>
+        </fieldset>
+
+        <fieldset data-sale>
+          <legend>Sale</legend>
+          <div class="form-grid">
+            <label>Sale price ($)<input name="sale_price" inputmode="decimal" placeholder="0.00"></label>
+            <label>Sale date<input name="sale_date" type="date"></label>
+            <label>Sold on<input name="sale_platform" list="platforms"></label>
+            <label>Fees ($)<input name="fees" inputmode="decimal" placeholder="0.00"></label>
+            <label>Shipping out ($)<input name="shipping_out" inputmode="decimal" placeholder="0.00"></label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Photo &amp; notes</legend>
+          <div class="photo-row">
+            <img id="photo-preview" alt="" hidden>
+            <div>
+              <input id="photo-input" type="file" accept="image/*">
+              <button type="button" id="photo-remove" class="btn small" hidden>Remove photo</button>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="span-4">Tags<input name="tags" placeholder="comma separated: pokemon, vintage"></label>
+            <label class="span-4">Notes<textarea name="notes" rows="3"></textarea></label>
+          </div>
+        </fieldset>
+        <p id="form-error" class="error" hidden></p>
+      </div>
+      <div class="dialog-foot">
+        <button type="button" id="delete-btn" class="btn danger" hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Sell dialog -->
+  <dialog id="sell-dialog">
+    <form id="sell-form" method="dialog">
+      <div class="dialog-head">
+        <h2>Record sale</h2>
+        <button type="button" class="btn ghost close" data-close aria-label="Close">✕</button>
+      </div>
+      <div class="dialog-body">
+        <p id="sell-item" class="muted"></p>
+        <div class="form-grid">
+          <label>Quantity sold<input name="quantity" type="number" min="1" step="1"></label>
+          <label>Sale price ($) *<input name="sale_price" inputmode="decimal" required></label>
+          <label>Sale date<input name="sale_date" type="date"></label>
+          <label>Sold on<input name="sale_platform" list="platforms"></label>
+          <label>Fees ($)<input name="fees" inputmode="decimal"></label>
+          <label>Shipping out ($)<input name="shipping_out" inputmode="decimal"></label>
+        </div>
+        <p id="sell-preview" class="muted small"></p>
+        <p id="sell-error" class="error" hidden></p>
+      </div>
+      <div class="dialog-foot">
+        <span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="submit" class="btn primary">Mark sold</button>
+      </div>
+    </form>
+  </dialog>
+
+  <datalist id="conditions">
+    <option>Mint</option><option>Near Mint</option><option>Lightly Played</option>
+    <option>Moderately Played</option><option>Heavily Played</option><option>Damaged</option>
+  </datalist>
+  <datalist id="graders">
+    <option>Raw</option><option>PSA</option><option>BGS</option><option>CGC</option><option>SGC</option><option>TAG</option>
+  </datalist>
+  <datalist id="platforms">
+    <option>eBay</option><option>TCGplayer</option><option>Whatnot</option><option>Mercari</option>
+    <option>Facebook Marketplace</option><option>Etsy</option><option>Card show</option><option>In person</option>
+  </datalist>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Your inventory data (database + photos) stays on your machine
+data/
+__pycache__/
+*.pyc
+.DS_Store
