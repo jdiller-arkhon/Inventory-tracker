@@ -15,12 +15,14 @@ import io
 import json
 import mimetypes
 import re
+import socket
 import sqlite3
 import sys
 import tempfile
 import threading
 import uuid
 import webbrowser
+import zipfile
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -207,6 +209,21 @@ class Inventory:
                     conn.execute(f"ALTER TABLE items ADD COLUMN {key} {SQL_TYPES[kind]}")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_items_status ON items(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_items_category ON items(category)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS photos ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " item_id INTEGER NOT NULL,"
+                " filename TEXT NOT NULL,"
+                " position INTEGER NOT NULL DEFAULT 0,"
+                " created_at TEXT NOT NULL)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_item ON photos(item_id)")
+            # Older versions stored a single photo on the item row.
+            conn.execute(
+                "INSERT INTO photos (item_id, filename, position, created_at)"
+                " SELECT id, photo, 0, updated_at FROM items WHERE photo IS NOT NULL AND photo != ''"
+            )
+            conn.execute("UPDATE items SET photo = NULL WHERE photo IS NOT NULL")
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -215,8 +232,9 @@ class Inventory:
         return datetime.now().isoformat(timespec="seconds")
 
     @staticmethod
-    def decorate(row):
+    def decorate(row, photos=()):
         item = dict(row)
+        item.pop("photo", None)
         total_cost = (item.get("cost") or 0) + (item.get("shipping_in") or 0)
         item["total_cost"] = round(total_cost, 2)
         item["profit"] = None
@@ -232,8 +250,27 @@ class Inventory:
                 item["days_held"] = (end - start).days
             except ValueError:
                 pass
-        item["photo_url"] = f"/photos/{item['photo']}" if item.get("photo") else None
+        item["photos"] = [{"id": p["id"], "url": f"/photos/{p['filename']}"} for p in photos]
+        item["photo_count"] = len(item["photos"])
+        item["photo_url"] = item["photos"][0]["url"] if item["photos"] else None
         return item
+
+    @staticmethod
+    def _photo_rows(conn, item_id=None):
+        """Photo rows grouped by item id, cover photo first."""
+        sql = "SELECT * FROM photos"
+        args = ()
+        if item_id is not None:
+            sql += " WHERE item_id = ?"
+            args = (item_id,)
+        grouped = {}
+        for row in conn.execute(sql + " ORDER BY item_id, position, id", args):
+            grouped.setdefault(row["item_id"], []).append(dict(row))
+        return grouped
+
+    def _decorated(self, conn, item_id):
+        row = self._get(conn, item_id)
+        return self.decorate(row, self._photo_rows(conn, item_id).get(item_id, [])) if row else None
 
     @staticmethod
     def _apply_status_defaults(fields, current=None):
@@ -271,8 +308,12 @@ class Inventory:
 
     # -- CRUD -------------------------------------------------------------- #
 
-    def list(self, q=None, category=None, status=None, sort="updated_at", order="desc"):
+    def list(self, q=None, category=None, status=None, sort="updated_at", order="desc", photos=None):
         where, args = [], []
+        if photos == "missing":
+            where.append("id NOT IN (SELECT item_id FROM photos)")
+        elif photos == "has":
+            where.append("id IN (SELECT item_id FROM photos)")
         if category in CATEGORIES:
             where.append("category = ?")
             args.append(category)
@@ -290,7 +331,8 @@ class Inventory:
         if where:
             sql += " WHERE " + " AND ".join(where)
         with self.connect() as conn:
-            items = [self.decorate(r) for r in conn.execute(sql, args)]
+            photo_rows = self._photo_rows(conn)
+            items = [self.decorate(r, photo_rows.get(r["id"], [])) for r in conn.execute(sql, args)]
         sort = sort if sort in SORTABLE else "updated_at"
         reverse = order != "asc"
         with_val = [i for i in items if i.get(sort) not in (None, "")]
@@ -301,8 +343,7 @@ class Inventory:
 
     def get(self, item_id):
         with self.connect() as conn:
-            row = self._get(conn, item_id)
-        return self.decorate(row) if row else None
+            return self._decorated(conn, item_id)
 
     def create(self, data):
         fields = self._apply_status_defaults(clean_fields(data))
@@ -324,8 +365,11 @@ class Inventory:
             current = self._get(conn, item_id)
             if not current:
                 return False
+            filenames = [r["filename"] for r in conn.execute("SELECT filename FROM photos WHERE item_id = ?", (item_id,))]
+            conn.execute("DELETE FROM photos WHERE item_id = ?", (item_id,))
             conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
-            self._remove_photo_if_unused(conn, current.get("photo"))
+            for filename in filenames:
+                self._remove_photo_if_unused(conn, filename)
         return True
 
     def sell(self, item_id, data):
@@ -348,7 +392,7 @@ class Inventory:
                 raise ValidationError(f"quantity sold must be between 1 and {have}")
             if qty == have:
                 self._update(conn, item_id, dict(sale, status="sold"))
-                return self.decorate(self._get(conn, item_id))
+                return self._decorated(conn, item_id)
 
             share = qty / have
             split = {}
@@ -362,13 +406,18 @@ class Inventory:
             new_row = {k: item.get(k) for k in FIELDS}
             new_row.update(**split, **sale, quantity=qty, status="sold")
             new_id = self._insert(conn, new_row)
-            if item.get("photo"):
-                conn.execute("UPDATE items SET photo = ? WHERE id = ?", (item["photo"], new_id))
-            return self.decorate(self._get(conn, new_id))
+            # The sold part keeps the lot's photos (files are shared, not copied).
+            conn.execute(
+                "INSERT INTO photos (item_id, filename, position, created_at)"
+                " SELECT ?, filename, position, created_at FROM photos WHERE item_id = ?",
+                (new_id, item_id),
+            )
+            return self._decorated(conn, new_id)
 
     # -- photos ------------------------------------------------------------ #
 
-    def set_photo(self, item_id, data_url):
+    @staticmethod
+    def _decode_image(data_url):
         match = re.match(r"^data:(image/[a-z+]+);base64,(.+)$", data_url or "", re.S)
         if not match or match.group(1) not in PHOTO_TYPES:
             raise ValidationError("photo must be a JPEG, PNG, WebP or GIF image")
@@ -376,29 +425,85 @@ class Inventory:
             raw = base64.b64decode(match.group(2), validate=True)
         except ValueError:
             raise ValidationError("photo data is not valid base64")
-        filename = f"{item_id}-{uuid.uuid4().hex[:10]}.{PHOTO_TYPES[match.group(1)]}"
-        with self.lock, self.connect() as conn:
-            item = self._get(conn, item_id)
-            if not item:
-                return None
-            (self.photo_dir / filename).write_bytes(raw)
-            conn.execute("UPDATE items SET photo = ?, updated_at = ? WHERE id = ?", (filename, self._now(), item_id))
-            self._remove_photo_if_unused(conn, item.get("photo"))
-        return self.get(item_id)
+        return raw, PHOTO_TYPES[match.group(1)]
 
-    def clear_photo(self, item_id):
+    def add_photos(self, item_id, images):
+        """Append one or more photos (data URLs) to an item."""
+        if isinstance(images, str):
+            images = [images]
+        if not images:
+            raise ValidationError("no photos supplied")
+        decoded = [self._decode_image(img) for img in images]
         with self.lock, self.connect() as conn:
-            item = self._get(conn, item_id)
-            if not item:
+            if not self._get(conn, item_id):
                 return None
-            conn.execute("UPDATE items SET photo = NULL, updated_at = ? WHERE id = ?", (self._now(), item_id))
-            self._remove_photo_if_unused(conn, item.get("photo"))
-        return self.get(item_id)
+            last = conn.execute("SELECT MAX(position) FROM photos WHERE item_id = ?", (item_id,)).fetchone()[0]
+            position = -1 if last is None else last
+            for raw, ext in decoded:
+                position += 1
+                filename = f"{uuid.uuid4().hex}.{ext}"
+                (self.photo_dir / filename).write_bytes(raw)
+                conn.execute(
+                    "INSERT INTO photos (item_id, filename, position, created_at) VALUES (?, ?, ?, ?)",
+                    (item_id, filename, position, self._now()),
+                )
+            conn.execute("UPDATE items SET updated_at = ? WHERE id = ?", (self._now(), item_id))
+            return self._decorated(conn, item_id)
+
+    def delete_photo(self, item_id, photo_id):
+        with self.lock, self.connect() as conn:
+            row = conn.execute("SELECT * FROM photos WHERE id = ? AND item_id = ?", (photo_id, item_id)).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+            self._remove_photo_if_unused(conn, row["filename"])
+            return self._decorated(conn, item_id)
+
+    def set_cover(self, item_id, photo_id):
+        with self.lock, self.connect() as conn:
+            row = conn.execute("SELECT * FROM photos WHERE id = ? AND item_id = ?", (photo_id, item_id)).fetchone()
+            if not row:
+                return None
+            first = conn.execute("SELECT MIN(position) FROM photos WHERE item_id = ?", (item_id,)).fetchone()[0]
+            conn.execute("UPDATE photos SET position = ? WHERE id = ?", (first - 1, photo_id))
+            return self._decorated(conn, item_id)
+
+    def photos_zip(self, item_id):
+        """All of an item's photos named SKU-1.jpg, SKU-2.jpg… ready for a listing."""
+        item = self.get(item_id)
+        if not item:
+            return None, None
+        base = re.sub(r"[^\w-]+", "_", item.get("sku") or f"item-{item_id}")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+            for n, photo in enumerate(item["photos"], start=1):
+                path = self.photo_path(photo["url"].rsplit("/", 1)[-1])
+                if path:
+                    zf.write(path, f"{base}-{n}{path.suffix}")
+        return buf.getvalue(), base
+
+    def match_filenames(self, names):
+        """Match photo filenames to items by SKU, e.g. 'CRD-00001.jpg' or
+        'crd-00001_back.jpg'. Returns {filename: item summary or None}."""
+        with self.connect() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT id, sku, name, status FROM items WHERE sku IS NOT NULL AND sku != ''")]
+        rows.sort(key=lambda r: -len(r["sku"]))  # prefer the longest (most specific) SKU
+        result = {}
+        for name in names:
+            stem = Path(str(name)).stem.strip().upper()
+            found = None
+            for row in rows:
+                sku = row["sku"].upper()
+                if stem == sku or (stem.startswith(sku) and stem[len(sku)] in "-_ .(#"):
+                    found = row
+                    break
+            result[name] = found
+        return result
 
     def _remove_photo_if_unused(self, conn, filename):
         if not filename:
             return
-        in_use = conn.execute("SELECT 1 FROM items WHERE photo = ? LIMIT 1", (filename,)).fetchone()
+        in_use = conn.execute("SELECT 1 FROM photos WHERE filename = ? LIMIT 1", (filename,)).fetchone()
         if not in_use:
             (self.photo_dir / filename).unlink(missing_ok=True)
 
@@ -479,6 +584,7 @@ class Inventory:
             "platforms": sorted(platforms.values(), key=lambda p: -p["revenue"]),
             "aging": [{k: i[k] for k in ("id", "sku", "name", "category", "status", "days_held", "total_cost")} for i in aging[:10]],
             "aging_count": len(aging),
+            "missing_photos": sum(1 for i in unsold if i["status"] != "personal" and not i["photo_count"]),
         }
 
     # -- CSV / backup ------------------------------------------------------ #
@@ -532,11 +638,29 @@ class Inventory:
 # HTTP
 # --------------------------------------------------------------------------- #
 
-ITEM_ROUTE = re.compile(r"^/api/items/(\d+)(?:/(sell|photo))?$")
+ITEM_ROUTE = re.compile(r"^/api/items/(\d+)(?:/(sell|photos|photos\.zip)(?:/(\d+)(?:/(cover))?)?)?$")
+
+
+def lan_addresses():
+    """Best guess at this machine's addresses on the local network."""
+    addrs = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.254.254.254", 1))  # no packets are sent; this just picks the outbound interface
+            addrs.add(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addrs.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(a for a in addrs if not a.startswith("127."))
 
 
 class Handler(BaseHTTPRequestHandler):
     inventory: Inventory = None
+    phone_urls: list = []
     server_version = "InventoryTracker/1.0"
 
     def log_message(self, fmt, *args):
@@ -616,7 +740,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/items":
             qs = {k: v[0] for k, v in parse_qs(url.query).items()}
             return self.send_json(inv.list(qs.get("q"), qs.get("category"), qs.get("status"),
-                                           qs.get("sort", "updated_at"), qs.get("order", "desc")))
+                                           qs.get("sort", "updated_at"), qs.get("order", "desc"), qs.get("photos")))
+        if path == "/api/info":
+            return self.send_json({"phone_urls": self.phone_urls})
         if path == "/api/stats":
             return self.send_json(inv.stats())
         if path == "/api/meta":
@@ -633,6 +759,12 @@ class Handler(BaseHTTPRequestHandler):
         if m and not m.group(2):
             item = inv.get(int(m.group(1)))
             return self.send_json(item) if item else self.send_error_json(HTTPStatus.NOT_FOUND, "item not found")
+        if m and m.group(2) == "photos.zip" and not m.group(3):
+            data, base = inv.photos_zip(int(m.group(1)))
+            if data is None:
+                return self.send_error_json(HTTPStatus.NOT_FOUND, "item not found")
+            return self.send_body(HTTPStatus.OK, data, "application/zip",
+                                  {"Content-Disposition": f'attachment; filename="{base}-photos.zip"'})
         if path.startswith("/photos/"):
             photo = inv.photo_path(unquote(path[len("/photos/"):]))
             return self.serve_file(photo) if photo else self.send_error_json(HTTPStatus.NOT_FOUND, "photo not found")
@@ -653,11 +785,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/import":
             text = self.read_body().decode("utf-8", errors="replace")
             return self.send_json(inv.import_csv(text))
+        if path == "/api/photos/match":
+            names = self.read_json().get("names") or []
+            if not isinstance(names, list):
+                raise ValidationError("names must be a list")
+            return self.send_json(inv.match_filenames([str(n) for n in names]))
         m = ITEM_ROUTE.match(path)
-        if m and m.group(2) == "sell":
+        route = (m.group(2), bool(m.group(3)), m.group(4)) if m else None
+        if route == ("sell", False, None):
             result = inv.sell(int(m.group(1)), self.read_json())
-        elif m and m.group(2) == "photo":
-            result = inv.set_photo(int(m.group(1)), self.read_json().get("data"))
+        elif route == ("photos", False, None):
+            body = self.read_json()
+            result = inv.add_photos(int(m.group(1)), body.get("images") or body.get("data"))
+        elif route == ("photos", True, "cover"):
+            result = inv.set_cover(int(m.group(1)), int(m.group(3)))
         else:
             return self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
         return self.send_json(result) if result else self.send_error_json(HTTPStatus.NOT_FOUND, "item not found")
@@ -674,9 +815,9 @@ class Handler(BaseHTTPRequestHandler):
         if not m:
             return self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
         item_id = int(m.group(1))
-        if m.group(2) == "photo":
-            item = self.inventory.clear_photo(item_id)
-            return self.send_json(item) if item else self.send_error_json(HTTPStatus.NOT_FOUND, "item not found")
+        if m.group(2) == "photos" and m.group(3) and not m.group(4):
+            item = self.inventory.delete_photo(item_id, int(m.group(3)))
+            return self.send_json(item) if item else self.send_error_json(HTTPStatus.NOT_FOUND, "photo not found")
         if m.group(2):
             return self.send_error_json(HTTPStatus.NOT_FOUND, "not found")
         if self.inventory.delete(item_id):
@@ -686,7 +827,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def make_server(data_dir, host="127.0.0.1", port=8765):
     handler = type("BoundHandler", (Handler,), {"inventory": Inventory(data_dir)})
-    return ThreadingHTTPServer((host, port), handler)
+    server = ThreadingHTTPServer((host, port), handler)
+    bound_port = server.server_address[1]
+    if host in ("0.0.0.0", ""):
+        handler.phone_urls = [f"http://{ip}:{bound_port}" for ip in lan_addresses()]
+    elif not host.startswith("127.") and host != "localhost":
+        handler.phone_urls = [f"http://{host}:{bound_port}"]
+    return server
 
 
 def main():
@@ -694,9 +841,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1, this machine only)")
     parser.add_argument("--port", type=int, default=8765, help="port to listen on (default 8765)")
     parser.add_argument("--data-dir", default=str(BASE_DIR / "data"), help="where the database and photos are stored")
+    parser.add_argument("--phone", action="store_true",
+                        help="allow phones/tablets on your Wi-Fi to connect (same as --host 0.0.0.0)")
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser window on start")
     parser.add_argument("--verbose", action="store_true", help="log every request")
     args = parser.parse_args()
+    if args.phone:
+        args.host = "0.0.0.0"
 
     try:
         server = make_server(args.data_dir, args.host, args.port)
@@ -707,6 +858,10 @@ def main():
     url = f"http://{shown_host}:{args.port}"
     print(f"Inventory tracker running at {url}")
     print(f"Data folder: {Path(args.data_dir).resolve()}")
+    phone_urls = server.RequestHandlerClass.phone_urls
+    if phone_urls:
+        print("On your phone (same Wi-Fi), open: " + "  or  ".join(phone_urls))
+        print("Anyone on this network can reach the tracker while it runs - use trusted networks only.")
     print("Press Ctrl+C to stop.")
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

@@ -13,6 +13,7 @@
     <nav class="tabs" role="tablist">
       <button role="tab" data-view="dashboard" class="tab active">Dashboard</button>
       <button role="tab" data-view="inventory" class="tab">Inventory</button>
+      <button role="tab" data-view="photos" class="tab">Photos</button>
     </nav>
     <div class="top-actions">
       <button id="theme-toggle" class="btn ghost" title="Toggle light/dark">◐</button>
@@ -75,7 +76,13 @@
           <option value="sold">Sold</option>
           <option value="personal">Personal collection</option>
         </select>
+        <select id="filter-photos" aria-label="Photos">
+          <option value="">Any photos</option>
+          <option value="missing">Missing photos</option>
+          <option value="has">Has photos</option>
+        </select>
         <span class="spacer"></span>
+        <button id="share-list-btn" class="btn" title="Post the items shown here as one WhatsApp message">Share on WhatsApp</button>
         <button id="export-btn" class="btn">Export CSV</button>
         <label class="btn" for="import-file">Import CSV</label>
         <input id="import-file" type="file" accept=".csv,text/csv" hidden>
@@ -102,6 +109,73 @@
           <tbody></tbody>
         </table>
         <div id="empty" class="empty" hidden>No items match. Click <b>+ Add item</b> to get started.</div>
+      </div>
+    </section>
+
+    <!-- Photos -->
+    <section id="view-photos" class="view" hidden>
+      <div id="phone-panel" class="panel phone-panel" hidden></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Photo queue</h2>
+          <select id="queue-filter" aria-label="Which items">
+            <option value="missing">Unsold items with no photos</option>
+            <option value="unsold">All unsold items</option>
+            <option value="all">Everything</option>
+          </select>
+          <span id="queue-progress" class="muted small"></span>
+        </div>
+        <div id="queue-empty" class="empty" hidden>Every item in this list has a photo.</div>
+        <div id="queue-card" class="queue-card" hidden>
+          <div class="q-info">
+            <div class="q-sku" id="q-sku"></div>
+            <div class="q-name" id="q-name"></div>
+            <div class="sub" id="q-detail"></div>
+            <div class="q-loc" id="q-loc"></div>
+          </div>
+          <div id="q-gallery" class="gallery large"></div>
+          <div class="q-actions">
+            <label class="btn primary big" for="q-camera">Take photo</label>
+            <input id="q-camera" class="vh" type="file" accept="image/*" capture="environment">
+            <label class="btn big" for="q-files">Add from files</label>
+            <input id="q-files" class="vh" type="file" accept="image/*" multiple>
+          </div>
+          <div class="q-nav">
+            <button type="button" id="q-prev" class="btn">&larr; Previous</button>
+            <span class="q-mid">
+              <button type="button" id="q-edit" class="btn ghost">Edit details</button>
+              <button type="button" id="q-kit" class="btn ghost">Listing kit</button>
+            </span>
+            <button type="button" id="q-next" class="btn primary">Next item &rarr;</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Bulk upload &amp; match</h2>
+        </div>
+        <p class="muted small">Shot a whole batch? Add them all at once. Photos named after an item's SKU
+          (<code>CRD-00001.jpg</code>, <code>CRD-00001-back.jpg</code>) attach to that item automatically.
+          Everything else shows up below so you can pick the item, or start a new item from them.</p>
+        <label id="dropzone" class="dropzone" for="bulk-files">
+          <b>Drop photos here</b><span class="muted small">or click to choose files</span>
+        </label>
+        <input id="bulk-files" class="vh" type="file" accept="image/*" multiple>
+        <div id="bulk-status" class="muted small bulk-status"></div>
+        <div id="unmatched-wrap" hidden>
+          <div class="assign-bar">
+            <span id="unmatched-count" class="muted small"></span>
+            <button type="button" id="select-all-btn" class="btn small">Select all</button>
+            <input id="assign-item" list="item-options" placeholder="Type a SKU or name…" autocomplete="off">
+            <button type="button" id="assign-btn" class="btn primary">Attach selected</button>
+            <button type="button" id="new-from-btn" class="btn">New item from selected</button>
+            <button type="button" id="discard-btn" class="btn ghost">Discard selected</button>
+          </div>
+          <div id="unmatched" class="unmatched-grid"></div>
+        </div>
+        <datalist id="item-options"></datalist>
       </div>
     </section>
   </main>
@@ -213,14 +287,20 @@
         </fieldset>
 
         <fieldset>
-          <legend>Photo &amp; notes</legend>
-          <div class="photo-row">
-            <img id="photo-preview" alt="" hidden>
-            <div>
-              <input id="photo-input" type="file" accept="image/*">
-              <button type="button" id="photo-remove" class="btn small" hidden>Remove photo</button>
-            </div>
+          <legend>Photos</legend>
+          <div id="form-gallery" class="gallery"></div>
+          <div class="photo-actions">
+            <label class="btn" for="form-camera">Take photo</label>
+            <input id="form-camera" class="vh" type="file" accept="image/*" capture="environment">
+            <label class="btn" for="form-files">Add photos</label>
+            <input id="form-files" class="vh" type="file" accept="image/*" multiple>
+            <a id="form-zip" class="btn ghost" hidden>Download all (.zip)</a>
+            <span class="muted small">The first photo is the cover. Click &#9733; to make a photo the cover.</span>
           </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Tags &amp; notes</legend>
           <div class="form-grid">
             <label class="span-4">Tags<input name="tags" placeholder="comma separated: pokemon, vintage"></label>
             <label class="span-4">Notes<textarea name="notes" rows="3"></textarea></label>
@@ -230,6 +310,7 @@
       </div>
       <div class="dialog-foot">
         <button type="button" id="delete-btn" class="btn danger" hidden>Delete</button>
+        <button type="button" id="form-kit-btn" class="btn" hidden>Listing kit</button>
         <span class="spacer"></span>
         <button type="button" class="btn" data-close>Cancel</button>
         <button type="submit" class="btn primary">Save</button>
@@ -254,6 +335,7 @@
           <label>Fees ($)<input name="fees" inputmode="decimal"></label>
           <label>Shipping out ($)<input name="shipping_out" inputmode="decimal"></label>
         </div>
+        <p id="fee-note" class="muted small" hidden></p>
         <p id="sell-preview" class="muted small"></p>
         <p id="sell-error" class="error" hidden></p>
       </div>
@@ -265,6 +347,62 @@
     </form>
   </dialog>
 
+  <!-- Listing kit -->
+  <dialog id="kit-dialog">
+    <div class="kit-wrap">
+      <div class="dialog-head">
+        <h2>Listing kit <span id="kit-name" class="muted small"></span></h2>
+        <button type="button" class="btn ghost close" data-close aria-label="Close">&#10005;</button>
+      </div>
+      <div class="dialog-body">
+        <p id="kit-hint" class="muted small"></p>
+        <div id="kit-photos" class="kit-photos"></div>
+        <div class="kit-field">
+          <div class="kit-label"><b>Title</b> <span id="kit-title-count" class="muted small"></span>
+            <button type="button" class="btn small" data-copy="kit-title">Copy title</button></div>
+          <textarea id="kit-title" rows="2"></textarea>
+        </div>
+        <div class="kit-field">
+          <div class="kit-label"><b>Description</b>
+            <button type="button" class="btn small" data-copy="kit-desc">Copy description</button></div>
+          <textarea id="kit-desc" rows="8"></textarea>
+        </div>
+        <p id="kit-meta" class="muted small"></p>
+      </div>
+      <div class="dialog-foot">
+        <button type="button" id="kit-wa-btn" class="btn wa">Share to WhatsApp</button>
+        <a id="kit-zip" class="btn">Download photos (.zip)</a>
+        <span class="spacer"></span>
+        <button type="button" class="btn primary" data-close>Done</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- WhatsApp stock list -->
+  <dialog id="share-dialog">
+    <div class="kit-wrap">
+      <div class="dialog-head">
+        <h2>Share list on WhatsApp</h2>
+        <button type="button" class="btn ghost close" data-close aria-label="Close">&#10005;</button>
+      </div>
+      <div class="dialog-body">
+        <p id="share-hint" class="muted small"></p>
+        <div class="share-opts">
+          <label><input type="checkbox" id="share-sku" checked> Include SKUs (so buyers can say which one)</label>
+          <label><input type="checkbox" id="share-detail" checked> Include details (set, grade, condition)</label>
+        </div>
+        <textarea id="share-text" rows="14"></textarea>
+        <p class="muted small">Edit anything you like before sending. WhatsApp shows <code>*text*</code> as bold.</p>
+      </div>
+      <div class="dialog-foot">
+        <button type="button" class="btn" data-copy="share-text">Copy</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="button" id="share-open-btn" class="btn wa">Open WhatsApp</button>
+      </div>
+    </div>
+  </dialog>
+
   <datalist id="conditions">
     <option>Mint</option><option>Near Mint</option><option>Lightly Played</option>
     <option>Moderately Played</option><option>Heavily Played</option><option>Damaged</option>
@@ -273,8 +411,8 @@
     <option>Raw</option><option>PSA</option><option>BGS</option><option>CGC</option><option>SGC</option><option>TAG</option>
   </datalist>
   <datalist id="platforms">
-    <option>eBay</option><option>TCGplayer</option><option>Whatnot</option><option>Mercari</option>
-    <option>Facebook Marketplace</option><option>Etsy</option><option>Card show</option><option>In person</option>
+    <option>Whatnot</option><option>eBay</option><option>TCGplayer</option><option>Mercari</option>
+    <option>WhatsApp</option><option>Facebook Marketplace</option><option>Etsy</option><option>Card show</option><option>In person</option>
   </datalist>
 
   <div id="toast" class="toast" hidden></div>

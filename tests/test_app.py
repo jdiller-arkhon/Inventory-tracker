@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import sys
 import tempfile
@@ -6,6 +7,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -114,20 +116,62 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 1)
 
     def test_photo_lifecycle(self):
+        img = f"data:image/png;base64,{PNG_1PX}"
         item = self.inv.create({"category": "card", "name": "x", "quantity": 2})
-        item = self.inv.set_photo(item["id"], f"data:image/png;base64,{PNG_1PX}")
-        photo = self.inv.photo_path(item["photo"])
-        self.assertTrue(photo.is_file())
-        # Split rows share the photo; it survives until the last reference goes.
+        item = self.inv.add_photos(item["id"], [img, img])
+        self.assertEqual(item["photo_count"], 2)
+        first, second = item["photos"]
+        self.assertEqual(item["photo_url"], first["url"])
+        item = self.inv.set_cover(item["id"], second["id"])
+        self.assertEqual(item["photo_url"], second["url"])
+        self.assertEqual(len(self.inv.list(photos="has")), 1)
+        self.assertEqual(len(self.inv.list(photos="missing")), 0)
+
+        # Split rows share the photo files; a file survives until its last reference goes.
         sold = self.inv.sell(item["id"], {"quantity": 1, "sale_price": 1})
-        self.assertEqual(sold["photo"], item["photo"])
-        self.inv.clear_photo(item["id"])
-        self.assertTrue(photo.is_file())
+        self.assertEqual([p["url"] for p in sold["photos"]], [p["url"] for p in item["photos"]])
+        path = self.inv.photo_path(second["url"].rsplit("/", 1)[-1])
+        self.inv.delete_photo(item["id"], second["id"])
+        self.assertTrue(path.is_file())
         self.inv.delete(sold["id"])
-        self.assertFalse(photo.exists())
+        self.assertFalse(path.exists())
+        self.assertEqual(self.inv.get(item["id"])["photo_count"], 1)
+
         with self.assertRaises(app.ValidationError):
-            self.inv.set_photo(item["id"], "data:text/html;base64,PGI+")
+            self.inv.add_photos(item["id"], ["data:text/html;base64,PGI+"])
         self.assertIsNone(self.inv.photo_path("../inventory.db"))
+        self.assertIsNone(self.inv.delete_photo(item["id"], 99999))
+
+    def test_photos_zip(self):
+        img = f"data:image/png;base64,{PNG_1PX}"
+        item = self.inv.create({"category": "art", "name": "x", "sku": "ART 7"})
+        self.inv.add_photos(item["id"], [img, img])
+        data, base = self.inv.photos_zip(item["id"])
+        self.assertEqual(base, "ART_7")
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            self.assertEqual(zf.namelist(), ["ART_7-1.png", "ART_7-2.png"])
+
+    def test_match_filenames(self):
+        a = self.inv.create({"category": "card", "name": "a"})
+        b = self.inv.create({"category": "card", "name": "b", "sku": f"{a['sku']}-X"})
+        names = [f"{a['sku']}.jpg", f"{a['sku'].lower()}_back.JPG", f"{a['sku']}-2.png",
+                 f"{b['sku']}.jpg", f"{a['sku']}9.jpg", "IMG_1234.jpg"]
+        m = self.inv.match_filenames(names)
+        self.assertEqual(m[names[0]]["id"], a["id"])
+        self.assertEqual(m[names[1]]["id"], a["id"])
+        self.assertEqual(m[names[2]]["id"], a["id"])
+        self.assertEqual(m[names[3]]["id"], b["id"])  # longest SKU wins
+        self.assertIsNone(m[names[4]])
+        self.assertIsNone(m[names[5]])
+
+    def test_migrates_single_photo_column(self):
+        item = self.inv.create({"category": "card", "name": "old"})
+        (self.inv.photo_dir / "legacy.png").write_bytes(base64.b64decode(PNG_1PX))
+        with self.inv.connect() as conn:
+            conn.execute("UPDATE items SET photo = 'legacy.png' WHERE id = ?", (item["id"],))
+        migrated = app.Inventory(self.tmp.name).get(item["id"])
+        self.assertEqual(migrated["photo_url"], "/photos/legacy.png")
+        self.assertEqual(migrated["photo_count"], 1)
 
 
 class HttpTests(unittest.TestCase):
@@ -162,8 +206,23 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["status"], "listed")
         status, body = self.call("POST", f"/api/items/{item['id']}/sell", {"sale_price": "60", "fees": "6"})
         self.assertEqual(json.loads(body)["profit"], 29.0)
+        status, body = self.call("POST", f"/api/items/{item['id']}/photos",
+                                 {"images": [f"data:image/png;base64,{PNG_1PX}"]})
+        photo = json.loads(body)["photos"][0]
+        status, body = self.call("GET", photo["url"])
+        self.assertEqual((status, body[:4]), (200, b"\x89PNG"))
+        status, body = self.call("POST", f"/api/items/{item['id']}/photos/{photo['id']}/cover")
+        self.assertEqual(status, 200)
+        status, body = self.call("GET", f"/api/items/{item['id']}/photos.zip")
+        self.assertEqual((status, body[:2]), (200, b"PK"))
+        status, body = self.call("POST", "/api/photos/match", {"names": [f"{item['sku']}.jpg", "nope.jpg"]})
+        self.assertEqual(json.loads(body)[f"{item['sku']}.jpg"]["id"], item["id"])
+        status, body = self.call("DELETE", f"/api/items/{item['id']}/photos/{photo['id']}")
+        self.assertEqual(json.loads(body)["photo_count"], 0)
         status, body = self.call("GET", "/api/stats")
         self.assertEqual(status, 200)
+        status, body = self.call("GET", "/api/info")
+        self.assertEqual(json.loads(body), {"phone_urls": []})
         status, body = self.call("DELETE", f"/api/items/{item['id']}")
         self.assertEqual(status, 200)
         status, _ = self.call("GET", f"/api/items/{item['id']}")
